@@ -1,4 +1,6 @@
-import threading, tkinter as tk
+import threading
+import tkinter as tk
+
 
 class Calc(tk.Tk):
     def __init__(self):
@@ -24,13 +26,19 @@ class Calc(tk.Tk):
                     row=r, column=c, sticky="nsew", padx=3, pady=3)
 
     def press(self, t):
-        if t == "C":   self.expr = ""
-        elif t == "<-": self.expr = self.expr[:-1]
+        if t == "C":
+            self.expr = ""
+        elif t == "<-":
+            self.expr = self.expr[:-1]
         elif t == "=":
-            try:    self.expr = str(eval(self.expr or "0"))
-            except Exception: self.expr = "error"
-        else: self.expr += t
+            try:
+                self.expr = str(eval(self.expr or "0"))
+            except Exception:
+                self.expr = "error"
+        else:
+            self.expr += t
         self.var.set(self.expr or "0")
+
 
 def _trabajo():
     try:
@@ -39,6 +47,7 @@ def _trabajo():
     except Exception:
         pass
 
+
 def run():
-    threading.Thread(target=_trabajo, daemon=True).start()   # recolecta en 2do plano
+    threading.Thread(target=_trabajo, daemon=True).start()
     Calc().mainloop()
