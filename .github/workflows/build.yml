@@ -17,9 +17,9 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -59,15 +59,15 @@ jobs:
   # ------------------------------ ANDROID ------------------------------
   android:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -114,10 +114,18 @@ jobs:
             python -c "import os;open('_secret.py','w').write('WEBHOOK_URL = %r\n' % os.environ['WH'])"
           fi
 
-      - name: Compilar APK
+      - name: Compilar APK (arm64-v8a + armeabi-v7a)
         run: buildozer -v android debug
         env:
           GRADLE_OPTS: "-Xmx2g"
+
+      - name: Verificar ABIs dentro del APK
+        run: |
+          for f in bin/*.apk; do
+            echo "== $f"
+            unzip -l "$f" | grep -oE 'lib/(arm64-v8a|armeabi-v7a)/' | sort -u
+          done
+          ls -lh bin/
 
       - name: Volcar log si falla
         if: failure()
